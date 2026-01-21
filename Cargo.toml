@@ -11,10 +11,12 @@ opt-level = 2
 lto = true
 
 [dependencies]
+anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+oxipng = "9"
 rayon = "1"
 tempfile = "3"
-zip = { version = "5", features = [
+zip = { version = "6", features = [
     "deflate-zopfli",
     "deflate-flate2-zlib",
     "deflate64",
