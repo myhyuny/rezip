@@ -88,143 +88,151 @@ fn recompress(path: &Path, args: &Args) -> Result<()> {
     drop(tx);
     let input_path = input.path().to_path_buf();
 
-    let result = jobs
-        .into_par_iter()
-        .try_for_each(move |(i, tx)| -> Result<()> {
-            let mut archive = ZipArchive::new(File::open(&input_path)?)?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        jobs.into_par_iter()
+            .try_for_each(move |(i, tx)| -> Result<()> {
+                let mut archive = ZipArchive::new(File::open(&input_path)?)?;
 
-            // 디렉토리는 raw copy
-            {
-                let file = archive.by_index_raw(i)?;
-                if file.is_dir() {
-                    let tmp = NamedTempFile::new()?;
+                // 디렉토리는 raw copy
+                {
+                    let file = archive.by_index_raw(i)?;
+                    if file.is_dir() {
+                        let tmp = NamedTempFile::new()?;
+                        let mut writer = ZipWriter::new(&tmp);
+                        writer.raw_copy_file(file)?;
+                        writer.finish()?;
+
+                        tx.send((i, tmp.into_temp_path()))
+                            .map_err(|_| anyhow!("writer thread exited early"))?;
+                        return Ok(());
+                    }
+                }
+
+                // 파일 내용 추출 및 메타데이터 저장
+                let mut file = archive.by_index(i)?;
+                let file_name = file.name().to_owned();
+                let compressed_size = file.compressed_size();
+                let unix_mode = file.unix_mode();
+                let last_modified = file.last_modified();
+                let base_options = file.options();
+
+                let mut extracted_file = NamedTempFile::new()?;
+                copy(&mut file, &mut extracted_file)?;
+                drop(file);
+                drop(archive);
+
+                // 시그니처 확인 및 중첩 압축 처리
+                let mut signature = [0u8; 8];
+                extracted_file.rewind()?;
+                let bytes_read = extracted_file.read(&mut signature)?;
+
+                if bytes_read >= 4 && signature[0..4] == ZIP_SIGNATURE {
+                    // ZIP - 재귀적 재압축
+                    if let Err(e) = recompress(extracted_file.path(), args) {
+                        eprintln!("Failed to recompress nested archive {}: {}", file_name, e);
+                    }
+                } else if bytes_read == 8 && signature == PNG_SIGNATURE {
+                    // PNG 최적화
+                    let mut buffer = Vec::new();
+                    extracted_file.rewind()?;
+                    extracted_file.read_to_end(&mut buffer)?;
+
+                    let mut opts = Options::max_compression();
+                    opts.deflate = Deflaters::Zopfli {
+                        iterations: NonZeroU8::new(args.level.clamp(1, 255) as u8).unwrap(),
+                    };
+                    if let Ok(optimized) = optimize_from_memory(&buffer, &opts)
+                        && optimized.len() < buffer.len()
+                    {
+                        extracted_file.rewind()?;
+                        extracted_file.as_file_mut().set_len(0)?;
+                        extracted_file.write_all(&optimized)?;
+                    }
+                }
+                let payload_size = extracted_file.as_file().metadata()?.len();
+
+                // Zopfli로 재압축 시도
+                let mut options = base_options
+                    .compression_method(Deflated)
+                    .compression_level(Some(args.level))
+                    .with_zopfli_buffer(Some(args.buffer));
+
+                if let Some(mode) = unix_mode {
+                    options = options.unix_permissions(mode);
+                }
+                if let Some(time) = last_modified {
+                    options = options.last_modified_time(time);
+                }
+
+                let tmp = NamedTempFile::new()?;
+                let after_size = {
                     let mut writer = ZipWriter::new(&tmp);
-                    writer.raw_copy_file(file)?;
-                    writer.finish()?;
+                    writer.start_file(&file_name, options)?;
+                    extracted_file.rewind()?;
+                    copy(&mut extracted_file, &mut writer)?;
+                    let mut archive = writer.finish_into_readable()?;
+                    let file = archive.by_index_raw(0)?;
+                    file.compressed_size()
+                };
+
+                // Zopfli 결과가 더 작으면 사용
+                if after_size < compressed_size && after_size < payload_size {
+                    println!(
+                        "{} {}%",
+                        file_name,
+                        (100f64 - (after_size as f64 / compressed_size as f64) * 100f64).ceil()
+                    );
 
                     tx.send((i, tmp.into_temp_path()))
                         .map_err(|_| anyhow!("writer thread exited early"))?;
                     return Ok(());
                 }
-            }
 
-            // 파일 내용 추출 및 메타데이터 저장
-            let mut file = archive.by_index(i)?;
-            let file_name = file.name().to_owned();
-            let compressed_size = file.compressed_size();
-            let unix_mode = file.unix_mode();
-            let last_modified = file.last_modified();
-            let base_options = file.options();
+                // 원본 압축이 더 작으면 raw copy (pass)
+                if compressed_size <= payload_size {
+                    let mut archive = ZipArchive::new(File::open(&input_path)?)?;
+                    let file = archive.by_index_raw(i)?;
 
-            let mut extracted_file = NamedTempFile::new()?;
-            copy(&mut file, &mut extracted_file)?;
-            drop(file);
-            drop(archive);
+                    let tmp = NamedTempFile::new()?;
+                    let mut writer = ZipWriter::new(&tmp);
+                    writer.raw_copy_file(file)?;
+                    writer.finish()?;
 
-            // 시그니처 확인 및 중첩 압축 처리
-            let mut signature = [0u8; 8];
-            extracted_file.rewind()?;
-            let bytes_read = extracted_file.read(&mut signature)?;
+                    println!("{} pass", file_name);
 
-            if bytes_read >= 4 && signature[0..4] == ZIP_SIGNATURE {
-                // ZIP - 재귀적 재압축
-                if let Err(e) = recompress(extracted_file.path(), args) {
-                    eprintln!("Failed to recompress nested archive {}: {}", file_name, e);
+                    tx.send((i, tmp.into_temp_path()))
+                        .map_err(|_| anyhow!("writer thread exited early"))?;
+                    return Ok(());
                 }
-            } else if bytes_read == 8 && signature == PNG_SIGNATURE {
-                // PNG 최적화
-                let mut buffer = Vec::new();
-                extracted_file.rewind()?;
-                extracted_file.read_to_end(&mut buffer)?;
 
-                let mut opts = Options::max_compression();
-                opts.deflate = Deflaters::Zopfli {
-                    iterations: NonZeroU8::new(args.level.clamp(1, 255) as u8).unwrap(),
-                };
-                if let Ok(optimized) = optimize_from_memory(&buffer, &opts)
-                    && optimized.len() < buffer.len()
-                {
-                    extracted_file.rewind()?;
-                    extracted_file.as_file_mut().set_len(0)?;
-                    extracted_file.write_all(&optimized)?;
-                }
-            }
-            let payload_size = extracted_file.as_file().metadata()?.len();
-
-            // Zopfli로 재압축 시도
-            let mut options = base_options
-                .compression_method(Deflated)
-                .compression_level(Some(args.level))
-                .with_zopfli_buffer(Some(args.buffer));
-
-            if let Some(mode) = unix_mode {
-                options = options.unix_permissions(mode);
-            }
-            if let Some(time) = last_modified {
-                options = options.last_modified_time(time);
-            }
-
-            let tmp = NamedTempFile::new()?;
-            let after_size = {
-                let mut writer = ZipWriter::new(&tmp);
-                writer.start_file(&file_name, options)?;
-                extracted_file.rewind()?;
-                copy(&mut extracted_file, &mut writer)?;
-                let mut archive = writer.finish_into_readable()?;
-                let file = archive.by_index_raw(0)?;
-                file.compressed_size()
-            };
-
-            // Zopfli 결과가 더 작으면 사용
-            if after_size < compressed_size && after_size < payload_size {
-                println!(
-                    "{} {}%",
-                    file_name,
-                    (100f64 - (after_size as f64 / compressed_size as f64) * 100f64).ceil()
-                );
-
-                tx.send((i, tmp.into_temp_path()))
-                    .map_err(|_| anyhow!("writer thread exited early"))?;
-                return Ok(());
-            }
-
-            // 원본 압축이 더 작으면 raw copy (pass)
-            if compressed_size <= payload_size {
-                let mut archive = ZipArchive::new(File::open(&input_path)?)?;
-                let file = archive.by_index_raw(i)?;
+                // 그 외에는 Stored로 저장
+                let stored_options = base_options.compression_method(Stored);
 
                 let tmp = NamedTempFile::new()?;
                 let mut writer = ZipWriter::new(&tmp);
-                writer.raw_copy_file(file)?;
+                writer.start_file(&file_name, stored_options)?;
+                extracted_file.rewind()?;
+                copy(&mut extracted_file, &mut writer)?;
                 writer.finish()?;
 
-                println!("{} pass", file_name);
+                println!("{} stored", file_name);
 
                 tx.send((i, tmp.into_temp_path()))
                     .map_err(|_| anyhow!("writer thread exited early"))?;
                 return Ok(());
-            }
-
-            // 그 외에는 Stored로 저장
-            let stored_options = base_options.compression_method(Stored);
-
-            let tmp = NamedTempFile::new()?;
-            let mut writer = ZipWriter::new(&tmp);
-            writer.start_file(&file_name, stored_options)?;
-            extracted_file.rewind()?;
-            copy(&mut extracted_file, &mut writer)?;
-            writer.finish()?;
-
-            println!("{} stored", file_name);
-
-            tx.send((i, tmp.into_temp_path()))
-                .map_err(|_| anyhow!("writer thread exited early"))?;
-            return Ok(());
-        });
+            })
+    }))
+    .unwrap_or_else(|panic| {
+        Err(anyhow!(
+            "a worker thread panicked: {}",
+            panic_message(panic)
+        ))
+    });
 
     let writer_result = writer
         .join()
-        .map_err(|_| anyhow!("writer thread panicked"))?;
+        .map_err(|panic| anyhow!("writer thread panicked: {}", panic_message(panic)))
+        .and_then(|result| result);
     let (zip, received) = match (result, writer_result) {
         (_, Err(error)) => return Err(error),
         (Err(error), Ok(_)) => return Err(error),
@@ -248,6 +256,16 @@ fn recompress(path: &Path, args: &Args) -> Result<()> {
 
     println!();
     Ok(())
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_owned();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    return "unknown panic".to_owned();
 }
 
 #[cfg(test)]

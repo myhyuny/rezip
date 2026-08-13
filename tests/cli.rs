@@ -20,6 +20,51 @@ fn run(path: &Path) -> std::process::Output {
         .expect("failed to run rezip")
 }
 
+fn crc32(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(!0_u32, |crc, &byte| {
+        (0..8).fold(crc ^ u32::from(byte), |crc, _| {
+            (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1))
+        })
+    }) ^ !0_u32
+}
+
+fn append_chunk(png: &mut Vec<u8>, name: [u8; 4], data: &[u8]) {
+    png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    png.extend_from_slice(&name);
+    png.extend_from_slice(data);
+    let mut crc_input = name.to_vec();
+    crc_input.extend_from_slice(data);
+    png.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+}
+
+fn unoptimized_png() -> Vec<u8> {
+    const WIDTH: usize = 64;
+    const HEIGHT: usize = 64;
+    let scanlines: Vec<u8> = (0..HEIGHT)
+        .flat_map(|_| std::iter::once(0).chain(std::iter::repeat_n(0xff, WIDTH * 4)))
+        .collect();
+
+    let mut zlib = vec![0x78, 0x01, 0x01];
+    zlib.extend_from_slice(&(scanlines.len() as u16).to_le_bytes());
+    zlib.extend_from_slice(&(!(scanlines.len() as u16)).to_le_bytes());
+    zlib.extend_from_slice(&scanlines);
+    let adler = scanlines.iter().fold((1_u32, 0_u32), |(a, b), byte| {
+        let a = (a + u32::from(*byte)) % 65_521;
+        (a, (b + a) % 65_521)
+    });
+    zlib.extend_from_slice(&((adler.1 << 16) | adler.0).to_be_bytes());
+
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&(WIDTH as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(HEIGHT as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    append_chunk(&mut png, *b"IHDR", &ihdr);
+    append_chunk(&mut png, *b"IDAT", &zlib);
+    append_chunk(&mut png, *b"IEND", &[]);
+    png
+}
+
 #[test]
 fn streams_completed_entries_in_original_order_without_losing_archive_metadata() {
     let dir = tempdir().unwrap();
@@ -136,4 +181,34 @@ fn preserves_the_original_when_a_worker_cannot_read_an_entry() {
     let output = run(&path);
     assert!(!output.status.success());
     assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn uses_the_smaller_png_payload_after_optimization() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("png.zip");
+    let original_png = unoptimized_png();
+    let mut writer = ZipWriter::new(File::create(&path).unwrap());
+    writer
+        .start_file(
+            "page.png",
+            SimpleFileOptions::default().compression_method(Stored),
+        )
+        .unwrap();
+    writer.write_all(&original_png).unwrap();
+    writer.finish().unwrap();
+
+    let output = run(&path);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut archive = ZipArchive::new(File::open(path).unwrap()).unwrap();
+    let mut page = archive.by_name("page.png").unwrap();
+    let mut optimized_png = Vec::new();
+    page.read_to_end(&mut optimized_png).unwrap();
+    assert!(optimized_png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(optimized_png.len() < original_png.len());
 }
