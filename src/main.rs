@@ -1,5 +1,5 @@
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{Read, Seek, Write, copy},
     num::NonZeroU8,
     path::{Path, PathBuf},
@@ -121,16 +121,30 @@ fn recompress(path: &Path, args: &Args) -> Result<()> {
                 drop(file);
                 drop(archive);
 
+                // Close the temporary file before recursively replacing it. This is
+                // required on Windows and makes the replacement visible through a
+                // fresh handle on Unix as well.
+                let extracted_path = extracted_file.into_temp_path();
+
                 // 시그니처 확인 및 중첩 압축 처리
                 let mut signature = [0u8; 8];
+                let mut extracted_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&extracted_path)?;
                 extracted_file.rewind()?;
                 let bytes_read = extracted_file.read(&mut signature)?;
 
                 if bytes_read >= 4 && signature[0..4] == ZIP_SIGNATURE {
                     // ZIP - 재귀적 재압축
-                    if let Err(e) = recompress(extracted_file.path(), args) {
+                    drop(extracted_file);
+                    if let Err(e) = recompress(&extracted_path, args) {
                         eprintln!("Failed to recompress nested archive {}: {}", file_name, e);
                     }
+                    extracted_file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&extracted_path)?;
                 } else if bytes_read == 8 && signature == PNG_SIGNATURE {
                     // PNG 최적화
                     let mut buffer = Vec::new();
@@ -145,11 +159,11 @@ fn recompress(path: &Path, args: &Args) -> Result<()> {
                         && optimized.len() < buffer.len()
                     {
                         extracted_file.rewind()?;
-                        extracted_file.as_file_mut().set_len(0)?;
+                        extracted_file.set_len(0)?;
                         extracted_file.write_all(&optimized)?;
                     }
                 }
-                let payload_size = extracted_file.as_file().metadata()?.len();
+                let payload_size = extracted_file.metadata()?.len();
 
                 // Zopfli로 재압축 시도
                 let mut options = base_options

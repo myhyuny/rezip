@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     path::Path,
     process::Command,
 };
@@ -211,4 +211,57 @@ fn uses_the_smaller_png_payload_after_optimization() {
     page.read_to_end(&mut optimized_png).unwrap();
     assert!(optimized_png.starts_with(b"\x89PNG\r\n\x1a\n"));
     assert!(optimized_png.len() < original_png.len());
+}
+
+#[test]
+fn recompresses_nested_zip_before_recompressing_the_outer_entry() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("nested.zip");
+    let inner = {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "payload.txt",
+                SimpleFileOptions::default().compression_method(Stored),
+            )
+            .unwrap();
+        writer.write_all(&vec![b'n'; 64 * 1024]).unwrap();
+        writer.finish().unwrap().into_inner()
+    };
+
+    let mut writer = ZipWriter::new(File::create(&path).unwrap());
+    writer
+        .start_file(
+            "nested.zip",
+            SimpleFileOptions::default().compression_method(Stored),
+        )
+        .unwrap();
+    writer.write_all(&inner).unwrap();
+    writer.finish().unwrap();
+
+    let original_size = {
+        let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        archive.by_name("nested.zip").unwrap().compressed_size()
+    };
+
+    let output = run(&path);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut outer = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+    let mut nested = outer.by_name("nested.zip").unwrap();
+    assert!(nested.compressed_size() < original_size);
+    let mut nested_bytes = Vec::new();
+    nested.read_to_end(&mut nested_bytes).unwrap();
+    drop(nested);
+
+    let mut inner = ZipArchive::new(Cursor::new(nested_bytes)).unwrap();
+    let mut payload = inner.by_name("payload.txt").unwrap();
+    assert_eq!(payload.compression(), Deflated);
+    let mut restored = Vec::new();
+    payload.read_to_end(&mut restored).unwrap();
+    assert_eq!(restored, vec![b'n'; 64 * 1024]);
 }
