@@ -34,7 +34,7 @@ cargo run -- -l 264 -b 1048576 archive.zip
 
 ### Error Handling
 
-- Error type aliased as `Box<dyn std::error::Error + Send + Sync>`
+- CLI functions return `anyhow::Result`; use `anyhow!` to add context to errors and `ensure!` for violated invariants
 - Uses temporary files to protect originals
 
 ### Platform Notes
